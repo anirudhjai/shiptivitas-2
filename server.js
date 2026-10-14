@@ -51,7 +51,7 @@ const validateId = (id) => {
  * @param {any} priority
  */
 const validatePriority = (priority) => {
-  if (Number.isNaN(priority)) {
+  if (!Number.isInteger(priority) || priority < 1) {
     return {
       valid: false,
       messageObj: {
@@ -95,7 +95,7 @@ app.get('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
   return res.status(200).send(db.prepare('select * from clients where id = ?').get(id));
 });
@@ -118,7 +118,7 @@ app.put('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
 
   let { status, priority } = req.body;
@@ -127,8 +127,55 @@ app.put('/api/v1/clients/:id', (req, res) => {
 
   /* ---------- Update code below ----------*/
 
+  const VALID_STATUSES = ['backlog', 'in-progress', 'complete'];
+  if (status !== undefined && !VALID_STATUSES.includes(status)) {
+    return res.status(400).send({
+      'message': 'Invalid status provided.',
+      'long_message': 'Status can only be one of the following: [backlog | in-progress | complete].',
+    });
+  }
+  if (priority !== undefined) {
+    const priorityCheck = validatePriority(priority);
+    if (!priorityCheck.valid) {
+      return res.status(400).send(priorityCheck.messageObj);
+    }
+  }
 
+  const oldStatus = client.status;
+  const newStatus = status || oldStatus;
 
+  // Same lane and no new priority: nothing to change (per README sample)
+  if (newStatus === oldStatus && priority === undefined) {
+    return res.status(200).send(clients);
+  }
+
+  // Build the lane we're moving into, in priority order, without the moved client
+  const byPriority = (a, b) => a.priority - b.priority;
+  const targetLane = clients
+    .filter(c => c.status === newStatus && c.id !== id)
+    .sort(byPriority);
+
+  // No priority given -> bottom of the lane. Out-of-range priority -> clamp.
+  let insertAt = priority === undefined ? targetLane.length : priority - 1;
+  insertAt = Math.min(insertAt, targetLane.length);
+  targetLane.splice(insertAt, 0, { ...client, status: newStatus });
+
+  // Renumber 1..n so priorities stay unique and gap-free in every lane we touched
+  const updateStmt = db.prepare('update clients set status = ?, priority = ? where id = ?');
+  const saveLane = (lane) => lane.forEach((c, i) => updateStmt.run(c.status, i + 1, c.id));
+
+  // Transaction: either every priority shift lands, or none do
+  db.transaction(() => {
+    saveLane(targetLane);
+    if (newStatus !== oldStatus) {
+      const sourceLane = clients
+        .filter(c => c.status === oldStatus && c.id !== id)
+        .sort(byPriority);
+      saveLane(sourceLane);
+    }
+  })();
+
+  clients = db.prepare('select * from clients').all();
   return res.status(200).send(clients);
 });
 
